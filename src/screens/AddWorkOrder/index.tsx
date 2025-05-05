@@ -102,7 +102,6 @@ export const AddWorkOrder = ({navigation}: any) => {
       <View style={styles.buttonWrapper}>
         <Button title="Criar" onPress={handleCreate} />
       </View>
-      <Button title="Print" onPress={() => {console.log(form.title, form.description, form.assignedTo, form.status)}} />
     </View>
   );
 };
