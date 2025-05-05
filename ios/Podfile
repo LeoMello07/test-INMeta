@@ -1,9 +1,7 @@
+ENV['RCT_NEW_ARCH_ENABLED'] ||= '0'   # compila em Paper
+
 # Resolve react_native_pods.rb with node to allow for hoisting
-require Pod::Executable.execute_command('node', ['-p',
-  'require.resolve(
-    "react-native/scripts/react_native_pods.rb",
-    {paths: [process.argv[1]]},
-  )', __dir__]).strip
+require_relative '../node_modules/react-native/scripts/react_native_pods'
 
 platform :ios, min_ios_version_supported
 prepare_react_native_project!
@@ -22,6 +20,9 @@ target 'INMetaTeste' do
     # An absolute path to your application root.
     :app_path => "#{Pod::Config.instance.installation_root}/.."
   )
+
+    pod 'react-native-safe-area-context',
+      :path => '../node_modules/react-native-safe-area-context'
 
   post_install do |installer|
     # https://github.com/facebook/react-native/blob/main/packages/react-native/scripts/react_native_pods.rb#L197-L202
