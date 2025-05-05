@@ -1,25 +1,27 @@
+// src/sync/syncService.ts
 import NetInfo from '@react-native-community/netinfo';
+import { api } from '../api/client';
 import { getRealm } from '../db/realm';
 import { WorkOrder } from '../db/schemas';
 import { useWorkOrdersStore } from '../store/workOrdersStores';
-import { workOrdersApi } from '../modules/api/workOrders';
 
 export const normalizeId = (id: any) => id.toString();
-
 let isSyncing = false;
+
+type SyncPayload = {
+  created: WorkOrder[];
+  updated: WorkOrder[];
+  deleted: string[];
+};
 
 const realmWrite = async (cb: (realm: Realm) => void) => {
   const realm = await getRealm();
   realm.write(() => cb(realm));
 };
 
-const buildPayload = (w: WorkOrder) => ({
-  title: w.title,
-  description: w.description,
-  status: w.status,
-  assignedTo: w.assignedTo,
-});
-
+/**
+ * Envia alterações locais pendentes para o servidor
+ */
 export const pushLocalChanges = async () => {
   if (isSyncing) return;
   isSyncing = true;
@@ -27,7 +29,6 @@ export const pushLocalChanges = async () => {
   try {
     const realm = await getRealm();
     const { upsertOrder, removeOrder } = useWorkOrdersStore.getState();
-
     const pendentes = realm
       .objects<WorkOrder>('WorkOrder')
       .filtered('pendingSync == true')
@@ -35,8 +36,9 @@ export const pushLocalChanges = async () => {
 
     for (const wo of pendentes) {
       try {
+        // deletions
         if (wo.deleted) {
-          await workOrdersApi.remove(wo.id);
+          await api.delete(`/work-orders/${wo.id}`);
           realmWrite((r) => {
             const obj = r.objectForPrimaryKey('WorkOrder', wo.id);
             if (obj) r.delete(obj);
@@ -45,57 +47,59 @@ export const pushLocalChanges = async () => {
           continue;
         }
 
-        const payload = buildPayload(wo);
-        const offlineId = wo.id.length > 10;
+        // build payload
+        const payload = {
+          title: wo.title,
+          description: wo.description,
+          status: wo.status,
+          assignedTo: wo.assignedTo,
+        };
+
         let resp;
+        const offlineId = wo.id.length > 10;
 
         if (offlineId) {
-          resp = await workOrdersApi.create(payload);
-
-          if (resp.status !== wo.status) {
-            resp = await workOrdersApi.update(resp.id, {
+          // POST
+          resp = await api.post<WorkOrder>('/work-orders', payload);
+          // ensure status
+          if (resp.data.status !== wo.status) {
+            resp = await api.put<WorkOrder>(`/work-orders/${resp.data.id}`, {
               ...payload,
               status: wo.status,
             });
           }
-
           removeOrder(wo.id);
         } else {
+          // PUT
           try {
-            resp = await workOrdersApi.update(wo.id, payload);
+            resp = await api.put<WorkOrder>(`/work-orders/${wo.id}`, payload);
           } catch (e: any) {
             const msg = e.response?.data?.message ?? '';
-            const notFound =
-              e.response?.status === 404 ||
-              (e.response?.status === 500 && msg.includes('No document'));
-
+            const notFound = e.response?.status === 404 || (e.response?.status === 500 && msg.includes('No document'));
             if (notFound) {
-              resp = await workOrdersApi.create(payload);
+              resp = await api.post<WorkOrder>('/work-orders', payload);
               removeOrder(wo.id);
-            } else {
-              throw e;
-            }
+            } else throw e;
           }
         }
 
+        // grava servidor no Realm
         const serverWO: WorkOrder = {
-          ...resp,
-          id: normalizeId(resp.id),
-          createdAt: new Date(resp.createdAt),
-          updatedAt: new Date(resp.updatedAt),
-          deletedAt: resp.deletedAt ? new Date(resp.deletedAt) : undefined,
-          status: wo.status,
+          ...resp.data,
+          id: normalizeId(resp.data.id),
+          createdAt: new Date(resp.data.createdAt),
+          updatedAt: new Date(resp.data.updatedAt),
+          deletedAt: resp.data.deletedAt ? new Date(resp.data.deletedAt) : undefined,
           pendingSync: false,
         };
 
         realmWrite((r) => {
-          const old = r.objectForPrimaryKey('WorkOrder', wo.id);
+          const old = r.objectForPrimaryKey('WorkOrder', normalizeId(wo.id));
           if (old) r.delete(old);
           r.create('WorkOrder', serverWO, 'modified');
         });
-
         upsertOrder(serverWO);
-      } catch (err: any) {
+      } catch (err) {
         console.warn('[sync] Falha ao sincronizar – mantém pendingSync', err);
       }
     }
@@ -104,35 +108,46 @@ export const pushLocalChanges = async () => {
   }
 };
 
+/**
+ * Busca apenas deltas no servidor desde a última sincronização
+ */
 export const pullFromServer = async () => {
-  const { setLastSync, upsertOrder } =
-    useWorkOrdersStore.getState();
+  const { lastSync, setLastSync, upsertOrder, removeOrder } = useWorkOrdersStore.getState();
 
-  const data = await workOrdersApi.getAll();
-
-  if (!Array.isArray(data)) {
-    console.warn('[pullFromServer] Erro ao buscar dados', data);
-    return;
-  }
+  const since = lastSync ?? new Date(0).toISOString();
+  const response = await api.get<SyncPayload>('/work-orders/sync', {
+    params: { since },
+  });
+  const { created, updated, deleted } = response.data;
 
   await realmWrite((realm) => {
-    data.forEach((wo) => {
+    // Creates and updates
+    [...created, ...updated].forEach((wo) => {
       realm.create(
         'WorkOrder',
         { ...wo, id: normalizeId(wo.id), pendingSync: false },
-        'modified',
+        'modified'
       );
       upsertOrder({ ...wo, id: normalizeId(wo.id), pendingSync: false });
+    });
+    // Deletions
+    deleted.forEach((id) => {
+      const key = normalizeId(id);
+      const obj = realm.objectForPrimaryKey<WorkOrder>('WorkOrder', key);
+      if (obj) realm.delete(obj);
+      removeOrder(key);
     });
   });
 
   setLastSync(new Date().toISOString());
 };
 
+/**
+ * Orquestra sync completo quando online
+ */
 export const syncIfOnline = async () => {
   const state = await NetInfo.fetch();
   if (!state.isConnected) return;
-
   await pushLocalChanges();
   await pullFromServer();
 };
